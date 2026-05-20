@@ -4,7 +4,9 @@ import asyncio
 import hashlib
 import logging
 import posixpath
+import re
 import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Iterable
@@ -62,6 +64,108 @@ from .util import call_all
 _LOGGER = logging.getLogger(__name__)
 
 PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
+
+
+# ---------------------------------------------------------------------------
+# System-wide PipeWire sink ducking
+# ---------------------------------------------------------------------------
+
+
+class _SinkDucker:
+    """Duck ALL PipeWire sinks via pactl on wake word; restore after TTS.
+
+    This silences Plexamp, Spotify, welle-io and any other system audio so
+    the microphone can hear the voice command without acoustic interference,
+    regardless of which sink they are playing through (D70, Anker, BT, etc.).
+
+    Volume values are saved as raw 0-65536 integers so they are restored to
+    the exact pre-duck level even when sinks have non-standard volumes.
+
+    A safety timer auto-restores after 45 s if TTS never fires (e.g. HA
+    pipeline error).
+    """
+
+    DUCK_PCT: int = 25          # duck target — 25% of full scale
+    SAFETY_S: float = 45.0     # auto-restore after this many seconds
+
+    def __init__(self) -> None:
+        self._saved: dict[str, str] = {}   # sink_name → raw volume integer
+        self._ducked: bool = False
+        self._timer: threading.Timer | None = None
+
+    # ------------------------------------------------------------------
+    def duck(self) -> None:
+        """Save current volumes and reduce all sinks to DUCK_PCT %."""
+        if self._ducked:
+            return
+        self._cancel_timer()
+        self._saved.clear()
+        for sink in self._list_sinks():
+            vol = self._get_volume(sink)
+            if vol is not None:
+                self._saved[sink] = vol
+                self._set_volume(sink, f"{self.DUCK_PCT}%")
+                _LOGGER.debug("Ducked sink %s (was %s)", sink, vol)
+        self._ducked = True
+        # Safety: auto-restore in case TTS callback never fires
+        self._timer = threading.Timer(self.SAFETY_S, self.unduck)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def unduck(self) -> None:
+        """Restore all sinks to their pre-duck volumes."""
+        self._cancel_timer()
+        if not self._ducked:
+            return
+        for sink, vol in self._saved.items():
+            self._set_volume(sink, vol)
+            _LOGGER.debug("Unducked sink %s → %s", sink, vol)
+        self._saved.clear()
+        self._ducked = False
+
+    # ------------------------------------------------------------------
+    def _list_sinks(self) -> list[str]:
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True, text=True, timeout=3,
+            )
+            return [
+                parts[1]
+                for line in r.stdout.splitlines()
+                if len(parts := line.split()) >= 2
+            ]
+        except Exception:
+            return []
+
+    def _get_volume(self, sink: str) -> str | None:
+        try:
+            r = subprocess.run(
+                ["pactl", "get-sink-volume", sink],
+                capture_output=True, text=True, timeout=3,
+            )
+            m = re.search(r"front-left:\s+(\d+)", r.stdout)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+
+    def _set_volume(self, sink: str, value: str) -> None:
+        try:
+            subprocess.run(
+                ["pactl", "set-sink-volume", sink, value],
+                timeout=3, check=False,
+            )
+        except Exception:
+            pass
+
+    def _cancel_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+
+# Module-level singleton — shared across all VoiceSatelliteProtocol instances
+_sink_ducker = _SinkDucker()
 
 
 class VoiceSatelliteProtocol(APIServer):
@@ -696,10 +800,12 @@ class VoiceSatelliteProtocol(APIServer):
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
         self.state.music_player.duck()
+        _sink_ducker.duck()   # also duck Plexamp/Spotify/welle-io/all PW sinks
 
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
         self.state.music_player.unduck()
+        _sink_ducker.unduck()  # restore all PipeWire sink volumes
 
     def _tts_finished(self) -> None:
         self._pipeline_active = False
