@@ -81,6 +81,11 @@ class _SinkDucker:
     Volume values are saved as raw 0-65536 integers so they are restored to
     the exact pre-duck level even when sinks have non-standard volumes.
 
+    Two-phase design to avoid saving mpv-elevated volumes:
+      save()        — called at wake word detection (before mpv plays anything)
+      apply_duck()  — called after wake sound finishes (reduces all sinks)
+      unduck()      — restores the volumes saved by save()
+
     A safety timer auto-restores after 45 s if TTS never fires (e.g. HA
     pipeline error).
     """
@@ -94,18 +99,34 @@ class _SinkDucker:
         self._timer: threading.Timer | None = None
 
     # ------------------------------------------------------------------
-    def duck(self) -> None:
-        """Save current volumes and reduce all sinks to DUCK_PCT %."""
-        if self._ducked:
-            return
-        self._cancel_timer()
+    def save(self) -> None:
+        """Snapshot current sink volumes before mpv touches anything.
+
+        Call this at wake word detection time — before the wake sound plays —
+        so we capture the true user-set volumes, not mpv-adjusted ones.
+        """
         self._saved.clear()
         for sink in self._list_sinks():
             vol = self._get_volume(sink)
             if vol is not None:
                 self._saved[sink] = vol
-                self._set_volume(sink, f"{self.DUCK_PCT}%")
-                _LOGGER.debug("Ducked sink %s (was %s)", sink, vol)
+                _LOGGER.debug("Saved sink %s volume = %s", sink, vol)
+
+    def apply_duck(self) -> None:
+        """Reduce all sinks to DUCK_PCT % using the previously saved baseline.
+
+        Call this after the wake sound finishes, just before audio streaming
+        starts.  Uses _saved volumes captured by save(), not current levels.
+        """
+        if self._ducked:
+            return
+        self._cancel_timer()
+        if not self._saved:
+            # save() was not called — fall back to saving now
+            self.save()
+        for sink in self._list_sinks():
+            self._set_volume(sink, f"{self.DUCK_PCT}%")
+            _LOGGER.debug("Ducked sink %s to %d%%", sink, self.DUCK_PCT)
         self._ducked = True
         # Safety: auto-restore in case TTS callback never fires
         self._timer = threading.Timer(self.SAFETY_S, self.unduck)
@@ -113,7 +134,7 @@ class _SinkDucker:
         self._timer.start()
 
     def unduck(self) -> None:
-        """Restore all sinks to their pre-duck volumes."""
+        """Restore all sinks to the volumes captured by save()."""
         self._cancel_timer()
         if not self._ducked:
             return
@@ -766,10 +787,10 @@ class VoiceSatelliteProtocol(APIServer):
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
         """Callback invoked when the wakeup sound finishes playing."""
         _LOGGER.debug("Wakeup sound finished, starting audio streaming with wake word: %s", wake_word_phrase)
-        # Duck system sinks NOW — after the wake sound, before streaming starts.
-        # This ensures the wake sound plays at full volume (audible confirmation)
-        # while music is silenced for the duration of the voice command + TTS.
-        _sink_ducker.duck()
+        # Apply duck NOW — after the wake sound, before streaming starts.
+        # Volumes were already saved by save() in duck() before mpv played
+        # anything, so unduck() will restore the true pre-interaction levels.
+        _sink_ducker.apply_duck()
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
         )
@@ -804,9 +825,10 @@ class VoiceSatelliteProtocol(APIServer):
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
         self.state.music_player.duck()
-        # Note: _sink_ducker.duck() is NOT called here — it is deferred to
-        # _on_wakeup_sound_finished() so the wake sound itself plays at full
-        # volume before system sinks are ducked.
+        # Save sink volumes NOW — before mpv plays the wake sound and potentially
+        # adjusts stream levels.  The actual volume reduction is deferred to
+        # _on_wakeup_sound_finished() so the wake sound plays at full volume.
+        _sink_ducker.save()
 
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
