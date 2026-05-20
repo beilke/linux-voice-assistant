@@ -151,12 +151,18 @@ class _SinkDucker:
                 ["pactl", "list", "short", "sinks"],
                 capture_output=True, text=True, timeout=3,
             )
-            return [
+            if r.returncode != 0:
+                _LOGGER.warning("pactl list sinks failed (rc=%d): %s", r.returncode, r.stderr.strip())
+                return []
+            sinks = [
                 parts[1]
                 for line in r.stdout.splitlines()
                 if len(parts := line.split()) >= 2
             ]
-        except Exception:
+            _LOGGER.debug("Found sinks: %s", sinks)
+            return sinks
+        except Exception as exc:
+            _LOGGER.warning("pactl list sinks exception: %s", exc)
             return []
 
     def _get_volume(self, sink: str) -> str | None:
@@ -165,19 +171,27 @@ class _SinkDucker:
                 ["pactl", "get-sink-volume", sink],
                 capture_output=True, text=True, timeout=3,
             )
+            if r.returncode != 0:
+                _LOGGER.warning("pactl get-sink-volume %s failed (rc=%d): %s", sink, r.returncode, r.stderr.strip())
+                return None
             m = re.search(r"front-left:\s+(\d+)", r.stdout)
+            if m is None:
+                _LOGGER.warning("pactl get-sink-volume %s: unexpected output: %r", sink, r.stdout.strip())
             return m.group(1) if m else None
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning("pactl get-sink-volume %s exception: %s", sink, exc)
             return None
 
     def _set_volume(self, sink: str, value: str) -> None:
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["pactl", "set-sink-volume", sink, value],
-                timeout=3, check=False,
+                capture_output=True, text=True, timeout=3, check=False,
             )
-        except Exception:
-            pass
+            if r.returncode != 0:
+                _LOGGER.warning("pactl set-sink-volume %s %s failed (rc=%d): %s", sink, value, r.returncode, r.stderr.strip())
+        except Exception as exc:
+            _LOGGER.warning("pactl set-sink-volume %s %s exception: %s", sink, value, exc)
 
     def _cancel_timer(self) -> None:
         if self._timer is not None:
@@ -824,15 +838,17 @@ class VoiceSatelliteProtocol(APIServer):
 
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
-        self.state.music_player.duck()
-        # Save sink volumes NOW — before mpv plays the wake sound and potentially
-        # adjusts stream levels.  The actual volume reduction is deferred to
-        # _on_wakeup_sound_finished() so the wake sound plays at full volume.
+        # NOTE: music_player.duck() is intentionally NOT called here.
+        # On this kiosk, music is played by Plexamp/Spotify (Flatpak) — LVA's
+        # built-in music player is unused.  Calling music_player.duck() kept a
+        # persistent mpv stream on the Anker sink at 50%, which caused
+        # music_player.unduck() (→ 100%) to leave the TTS output level elevated.
+        # All ducking is handled exclusively via _sink_ducker (pactl sink volume).
         _sink_ducker.save()
 
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
-        self.state.music_player.unduck()
+        # music_player.unduck() intentionally NOT called — see duck() note above.
         _sink_ducker.unduck()  # restore all PipeWire sink volumes
 
     def _tts_finished(self) -> None:
