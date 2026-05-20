@@ -110,7 +110,7 @@ class _SinkDucker:
             vol = self._get_volume(sink)
             if vol is not None:
                 self._saved[sink] = vol
-                _LOGGER.debug("Saved sink %s volume = %s", sink, vol)
+                _LOGGER.info("[duck] SAVE  sink=%-55s raw=%s", sink, vol)
 
     def apply_duck(self) -> None:
         """Reduce all sinks to DUCK_PCT % using the previously saved baseline.
@@ -123,10 +123,11 @@ class _SinkDucker:
         self._cancel_timer()
         if not self._saved:
             # save() was not called — fall back to saving now
+            _LOGGER.warning("[duck] apply_duck called without prior save() — saving now")
             self.save()
         for sink in self._list_sinks():
             self._set_volume(sink, f"{self.DUCK_PCT}%")
-            _LOGGER.debug("Ducked sink %s to %d%%", sink, self.DUCK_PCT)
+            _LOGGER.info("[duck] DUCK  sink=%-55s → %d%%", sink, self.DUCK_PCT)
         self._ducked = True
         # Safety: auto-restore in case TTS callback never fires
         self._timer = threading.Timer(self.SAFETY_S, self.unduck)
@@ -137,10 +138,15 @@ class _SinkDucker:
         """Restore all sinks to the volumes captured by save()."""
         self._cancel_timer()
         if not self._ducked:
+            _LOGGER.info("[duck] unduck() called but _ducked=False — skipping")
+            return
+        if not self._saved:
+            _LOGGER.warning("[duck] unduck() called with empty _saved — nothing to restore")
+            self._ducked = False
             return
         for sink, vol in self._saved.items():
             self._set_volume(sink, vol)
-            _LOGGER.debug("Unducked sink %s → %s", sink, vol)
+            _LOGGER.info("[duck] RESTORE sink=%-55s → raw=%s", sink, vol)
         self._saved.clear()
         self._ducked = False
 
