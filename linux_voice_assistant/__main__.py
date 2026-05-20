@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import logging
+import subprocess
 import sys
 import threading
 import time
@@ -36,6 +37,126 @@ _MODULE_DIR = Path(__file__).parent
 _REPO_DIR = _MODULE_DIR.parent
 _WAKEWORDS_DIR = _REPO_DIR / "wakewords"
 _SOUNDS_DIR = _REPO_DIR / "sounds"
+
+
+# -----------------------------------------------------------------------------
+# Kiosk mic backends — replace soundcard (broken under PipeWire-pulse 1.6+)
+# -----------------------------------------------------------------------------
+
+
+class _ArecordRecorder:
+    """Context manager that captures raw S16LE PCM via an arecord subprocess.
+
+    Used for ALSA devices (plughw:*).  arecord is the only reliable way to
+    read from ALSA hw devices when PipeWire owns the USB audio stack.
+    """
+
+    def __init__(self, device: str, blocksize: int) -> None:
+        self._device = device
+        self._blocksize = blocksize
+        self._proc: Optional[subprocess.Popen] = None  # type: ignore[type-arg]
+
+    def __enter__(self) -> "_ArecordRecorder":
+        self._proc = subprocess.Popen(
+            ["arecord", "-D", self._device, "-r", "16000", "-c", "1",
+             "-f", "S16_LE", "-t", "raw", "-q"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    def record(self, numframes: int) -> np.ndarray:
+        nbytes = numframes * 2  # 16-bit = 2 bytes/sample
+        assert self._proc is not None and self._proc.stdout is not None
+        data = b""
+        while len(data) < nbytes:
+            chunk = self._proc.stdout.read(nbytes - len(data))
+            if not chunk:
+                break
+            data += chunk
+        arr = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+        return arr.reshape(-1, 1)  # (numframes, 1) — matches soundcard shape
+
+
+class _FifoReader:
+    """Read raw S16LE PCM from a named FIFO written by an external process.
+
+    lva-start.sh runs pw-cat in the shell session (which has full PipeWire
+    access) writing to /tmp/lva_mic_cap.raw before exec-ing LVA.  LVA reads
+    from the FIFO here without spawning any PipeWire subprocess — subprocesses
+    spawned from a systemd user service cannot connect to PipeWire.
+
+    O_NONBLOCK is used to open the read end so we never deadlock if pw-cat has
+    not yet opened the write end.  The fd is then switched back to blocking so
+    record() reads block until data arrives.
+    """
+
+    def __init__(self, fifo_path: str, blocksize: int) -> None:
+        self._fifo_path = fifo_path
+        self._blocksize = blocksize
+        self._fifo_file = None
+
+    def __enter__(self) -> "_FifoReader":
+        import os
+        import fcntl
+        fd = os.open(self._fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+        self._fifo_file = os.fdopen(fd, "rb")
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self._fifo_file is not None:
+            try:
+                self._fifo_file.close()
+            except Exception:
+                pass
+
+    def record(self, numframes: int) -> np.ndarray:
+        nbytes = numframes * 2  # 16-bit = 2 bytes/sample
+        assert self._fifo_file is not None
+        data = b""
+        while len(data) < nbytes:
+            chunk = self._fifo_file.read(nbytes - len(data))
+            if not chunk:
+                break
+            data += chunk
+        arr = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+        return arr.reshape(-1, 1)  # (numframes, 1) — matches soundcard shape
+
+
+class ArecordMicrophone:
+    """Drop-in mic replacement — dispatches on device string prefix.
+
+    fifo:<path>  → _FifoReader        (pre-existing FIFO from lva-start.sh pw-cat)
+    plughw:*     → _ArecordRecorder   (ALSA direct, e.g. internal mic plughw:PCH,0)
+
+    The soundcard library's CFFI backend delivers 0 PCM frames under
+    PipeWire-pulse 1.6.2.  This class replaces it for kiosk deployments.
+    """
+
+    def __init__(self, device: str = "plughw:PCH,0") -> None:
+        self._device = device
+        if device.startswith("fifo:"):
+            self._backend = "fifo"
+            self.name = f"FIFO reader ({device[5:]})"
+        else:
+            self._backend = "arecord"
+            self.name = f"arecord ({device})"
+
+    def recorder(self, samplerate: int = 16000, channels: int = 1,
+                 blocksize: int = 1024) -> "_ArecordRecorder | _FifoReader":
+        if self._backend == "fifo":
+            return _FifoReader(self._device[5:], blocksize)
+        return _ArecordRecorder(self._device, blocksize)
 
 
 # -----------------------------------------------------------------------------
@@ -241,13 +362,19 @@ async def main() -> None:
     args.download_dir = Path(args.download_dir)
     args.download_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resolve microphone
-    if args.audio_input_device is not None:
+    # Resolve microphone.
+    # fifo: and plughw: prefixes → ArecordMicrophone (PipeWire-safe backends).
+    # Numeric index or soundcard name → soundcard (upstream default).
+    if args.audio_input_device is not None and (
+        args.audio_input_device.startswith("fifo:")
+        or args.audio_input_device.startswith("plughw:")
+    ):
+        mic = ArecordMicrophone(args.audio_input_device)
+    elif args.audio_input_device is not None:
         try:
             args.audio_input_device = int(args.audio_input_device)
         except ValueError:
             pass
-
         mic = sc.get_microphone(args.audio_input_device)
     else:
         mic = sc.default_microphone()
