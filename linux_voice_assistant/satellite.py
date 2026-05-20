@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import os
 import posixpath
 import re
 import shutil
@@ -72,18 +73,20 @@ PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
 
 
 class _SinkDucker:
-    """Duck ALL PipeWire sinks via pactl on wake word; restore after TTS.
+    """Duck music sinks via pactl on wake word; restore after TTS.
 
-    This silences Plexamp, Spotify, welle-io and any other system audio so
-    the microphone can hear the voice command without acoustic interference,
-    regardless of which sink they are playing through (D70, Anker, BT, etc.).
+    Ducks all sinks EXCEPT the Anker TTS output sink (identified by the
+    ANKER_SINK env var set by lva-start.sh).  The Anker is excluded because:
+      - It is the TTS *output* — ducking it makes the voice assistant inaudible.
+      - Ducking is needed to silence *music* (D70, BT) so the Anker *mic* can
+        hear the voice command without acoustic interference from speakers.
 
     Volume values are saved as raw 0-65536 integers so they are restored to
     the exact pre-duck level even when sinks have non-standard volumes.
 
     Two-phase design to avoid saving mpv-elevated volumes:
       save()        — called at wake word detection (before mpv plays anything)
-      apply_duck()  — called after wake sound finishes (reduces all sinks)
+      apply_duck()  — called after wake sound finishes (reduces music sinks)
       unduck()      — restores the volumes saved by save()
 
     A safety timer auto-restores after 45 s if TTS never fires (e.g. HA
@@ -92,6 +95,10 @@ class _SinkDucker:
 
     DUCK_PCT: int = 25          # duck target — 25% of full scale
     SAFETY_S: float = 45.0     # auto-restore after this many seconds
+
+    # Anker sink to EXCLUDE from ducking — set by lva-start.sh via env var.
+    # Excluding it keeps TTS audible at full volume while music is ducked.
+    _ANKER_SINK: str = os.environ.get("ANKER_SINK", "")
 
     def __init__(self) -> None:
         self._saved: dict[str, str] = {}   # sink_name → raw volume integer
@@ -165,7 +172,14 @@ class _SinkDucker:
                 for line in r.stdout.splitlines()
                 if len(parts := line.split()) >= 2
             ]
-            _LOGGER.debug("Found sinks: %s", sinks)
+            # Exclude the Anker TTS output from ducking so TTS stays audible.
+            if self._ANKER_SINK:
+                music_sinks = [s for s in sinks if s != self._ANKER_SINK]
+                excluded = [s for s in sinks if s == self._ANKER_SINK]
+                if excluded:
+                    _LOGGER.debug("Excluding Anker TTS sink from duck: %s", excluded)
+                sinks = music_sinks
+            _LOGGER.debug("Music sinks to duck: %s", sinks)
             return sinks
         except Exception as exc:
             _LOGGER.warning("pactl list sinks exception: %s", exc)
