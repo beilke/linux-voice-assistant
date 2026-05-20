@@ -766,6 +766,10 @@ class VoiceSatelliteProtocol(APIServer):
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
         """Callback invoked when the wakeup sound finishes playing."""
         _LOGGER.debug("Wakeup sound finished, starting audio streaming with wake word: %s", wake_word_phrase)
+        # Duck system sinks NOW — after the wake sound, before streaming starts.
+        # This ensures the wake sound plays at full volume (audible confirmation)
+        # while music is silenced for the duration of the voice command + TTS.
+        _sink_ducker.duck()
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)],
         )
@@ -800,7 +804,9 @@ class VoiceSatelliteProtocol(APIServer):
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
         self.state.music_player.duck()
-        _sink_ducker.duck()   # also duck Plexamp/Spotify/welle-io/all PW sinks
+        # Note: _sink_ducker.duck() is NOT called here — it is deferred to
+        # _on_wakeup_sound_finished() so the wake sound itself plays at full
+        # volume before system sinks are ducked.
 
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
