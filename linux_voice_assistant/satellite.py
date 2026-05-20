@@ -166,6 +166,13 @@ class _SinkDucker:
             return []
 
     def _get_volume(self, sink: str) -> str | None:
+        """Return the raw PulseAudio volume integer for *sink*'s first channel.
+
+        pactl output varies by sink type:
+          Stereo sinks (Anker USB):   "front-left: 65536 / 100%"
+          Multi-channel sinks (D70):  "aux0: 65536 / 100%, aux1: 65536 / 100%..."
+        We match the FIRST channel regardless of its name so both formats work.
+        """
         try:
             r = subprocess.run(
                 ["pactl", "get-sink-volume", sink],
@@ -174,7 +181,8 @@ class _SinkDucker:
             if r.returncode != 0:
                 _LOGGER.warning("pactl get-sink-volume %s failed (rc=%d): %s", sink, r.returncode, r.stderr.strip())
                 return None
-            m = re.search(r"front-left:\s+(\d+)", r.stdout)
+            # Match any channel name (front-left, aux0, mono, …) followed by the raw int
+            m = re.search(r"[\w][\w-]*:\s+(\d+)", r.stdout)
             if m is None:
                 _LOGGER.warning("pactl get-sink-volume %s: unexpected output: %r", sink, r.stdout.strip())
             return m.group(1) if m else None
