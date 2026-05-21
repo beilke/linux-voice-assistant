@@ -232,6 +232,13 @@ class _SinkDucker:
 # Module-level singleton — shared across all VoiceSatelliteProtocol instances
 _sink_ducker = _SinkDucker()
 
+# Hard timeout for TTS playback (seconds).
+# If the TTS player hasn't called its done_callback within this time the player
+# is force-stopped.  This recovers from HA streaming TTS whose HTTP connection
+# never closes (piper stuck/slow on CPU).  60 s is generous for any realistic
+# voice assistant response; a typical response is 2–10 s.
+_TTS_TIMEOUT_S: float = 60.0
+
 
 class VoiceSatelliteProtocol(APIServer):
 
@@ -494,6 +501,12 @@ class VoiceSatelliteProtocol(APIServer):
         self._external_wake_words: Dict[str, VoiceAssistantExternalWakeWord] = {}
         self._disconnect_event = asyncio.Event()
 
+        # TTS hard timeout — cancelled when _tts_finished() runs normally.
+        # Guards against HA streaming TTS whose HTTP connection never closes
+        # (e.g. piper stuck on CPU).  After TTS_TIMEOUT_S seconds the player
+        # is force-stopped, _tts_finished() fires, and LVA becomes responsive.
+        self._tts_timeout_timer: Optional[threading.Timer] = None
+
     def _set_thinking_sound_enabled(self, new_state: bool) -> None:
         self.state.thinking_sound_enabled = bool(new_state)
         self.state.preferences.thinking_sound = 1 if self.state.thinking_sound_enabled else 0
@@ -633,6 +646,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._continue_conversation = msg.start_conversation
 
             self.duck()
+            self._start_tts_timeout()
             self.state.tts_player.play(urls, done_callback=self._tts_finished)
         elif isinstance(msg, VoiceAssistantTimerEventResponse):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
@@ -856,14 +870,50 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.tts_player.stop()
             _LOGGER.debug("TTS response stopped manually")
 
+    # ---- TTS timeout helpers ----------------------------------------
+
+    def _start_tts_timeout(self) -> None:
+        """Start the hard TTS timeout; cancels any previous timer."""
+        self._cancel_tts_timeout()
+        t = threading.Timer(_TTS_TIMEOUT_S, self._on_tts_timeout)
+        t.daemon = True
+        t.start()
+        self._tts_timeout_timer = t
+        _LOGGER.debug("TTS timeout timer started (%.0f s)", _TTS_TIMEOUT_S)
+
+    def _cancel_tts_timeout(self) -> None:
+        """Cancel the TTS timeout timer if it is pending."""
+        t = self._tts_timeout_timer
+        if t is not None:
+            t.cancel()
+            self._tts_timeout_timer = None
+
+    def _on_tts_timeout(self) -> None:
+        """Called when TTS has not finished within _TTS_TIMEOUT_S seconds.
+
+        Force-stops the TTS player so MpvMediaPlayer.stop() invokes the
+        done_callback (_tts_finished), which clears _pipeline_active and
+        sends VoiceAssistantAnnounceFinished to Home Assistant.
+        """
+        self._tts_timeout_timer = None
+        _LOGGER.warning(
+            "TTS timeout (%.0f s) — force-stopping player. "
+            "HA TTS stream may never have closed (piper stuck/slow).",
+            _TTS_TIMEOUT_S,
+        )
+        self.state.tts_player.stop()
+
+    # ---- TTS playback -----------------------------------------------
+
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
             return
 
         self._tts_played = True
-        _LOGGER.debug("Playing TTS response: %s", self._tts_url)
+        _LOGGER.info("Playing TTS: %s", self._tts_url)
 
         self.state.active_wake_words.add(self.state.stop_word.id)
+        self._start_tts_timeout()
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
     def duck(self) -> None:
@@ -882,6 +932,7 @@ class VoiceSatelliteProtocol(APIServer):
         _sink_ducker.unduck()  # restore all PipeWire sink volumes
 
     def _tts_finished(self) -> None:
+        self._cancel_tts_timeout()  # no-op if already cancelled or timed out
         self._pipeline_active = False
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self.send_messages([VoiceAssistantAnnounceFinished()])
