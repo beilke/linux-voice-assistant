@@ -27,15 +27,18 @@ class LibMpvPlayer(AudioPlayer):
         self._user_volume: float = 100.0  # 0.0 – 100.0
         self._duck_factor: float = 1.0  # 0.0 – 1.0
 
-        # mpv setup
-        self._mpv = mpv.MPV(
+        # mpv setup — audio_device passed at construction so it is set before
+        # audio-stream-silence opens the first stream (post-init property set
+        # is too late: the silence stream picks up the default sink first).
+        mpv_kwargs: dict = dict(
             audio_display=False,
             log_handler=self._on_mpv_log,
-            loglevel="error",
+            loglevel="warn",  # warn catches device errors; "error" misses some
         )
-
         if device:
-            self._mpv["audio-device"] = device
+            mpv_kwargs["audio_device"] = device
+
+        self._mpv = mpv.MPV(**mpv_kwargs)
 
         # Pre-buffer audio before the sink starts clocking samples out.
         # The default (0.2 s) is too tight for short notification sounds on
