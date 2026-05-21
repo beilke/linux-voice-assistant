@@ -213,7 +213,7 @@ class LibMpvPlayer(AudioPlayer):
     def _on_start_file(self, event) -> None:
         """Called when mpv starts playing a file."""
         with self._state_lock:
-            self._log.debug("_on_start_file: state=%s", self._state)
+            self._log.info("mpv: playback started (state was %s)", self._state)
             self._set_state(PlayerState.PLAYING)
 
     def _on_mpv_log(self, level: str, prefix: str, text: str) -> None:

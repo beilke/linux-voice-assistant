@@ -94,7 +94,9 @@ class _SinkDucker:
     """
 
     DUCK_PCT: int = 25          # duck target — 25% of full scale
-    SAFETY_S: float = 45.0     # auto-restore after this many seconds
+    SAFETY_S: float = 120.0    # auto-restore after this many seconds
+    # 120 s covers slow CPU piper TTS generation (streaming HTTP, piper at 0.3×
+    # real-time = ~40 s to generate a 12-second response) plus a safety margin.
 
     # Anker sink to EXCLUDE from ducking — set by lva-start.sh via env var.
     # Excluding it keeps TTS audible at full volume while music is ducked.
